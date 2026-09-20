@@ -160,20 +160,15 @@ module Redis
     # `WRONGTYPE`) is deterministic and is left to propagate immediately;
     # retrying it against a different master wouldn't change the outcome.
     #
-    # There's deliberately no delay between attempts here. By the time any of
-    # the exceptions above reaches this method, real wall-clock time has
-    # already passed: `Connection#run` (connection.cr) retries internally —
-    # up to 5 reconnect attempts against the *same* dead host, each bounded
-    # by `connect_timeout` (default 5s) — and `DB::Pool#retry` (crystal-db)
-    # adds its own attempts with its own `retry_delay` on top of that. A
-    # single failed attempt can therefore already take tens of seconds; an
-    # additional artificial sleep here wouldn't meaningfully improve the odds
-    # of the next attempt landing on a promoted master, it would just stack
-    # more latency on latency that's already substantial. `attempts` defaults
-    # to 1 (i.e. no retry) for the same reason — since one attempt is already
-    # expensive, silently retrying more than once should be something the
-    # caller opts into deliberately, not a default that can turn one slow
-    # failure into a much slower one.
+    # There's deliberately no delay between attempts here: the layers below
+    # (`Connection`, `DB::Pool`) already retry with their own delays, so a
+    # single failed attempt can already take tens of seconds by the time it
+    # reaches this method — an additional sleep here would just stack more
+    # latency on top. `attempts` defaults to 1 (no retry) for the same
+    # reason: retrying more than once should be an explicit opt-in, not a
+    # default that can turn one slow failure into a much slower one.
+    # See #80 for the broader discussion of collapsing these redundant
+    # retry layers.
     #
     # **This is opt-in, not automatic** — a connection error never reveals
     # whether the command reached the old master before it died, so only
