@@ -192,14 +192,14 @@ module Redis
     # instance state involved) so it can be unit tested without a live
     # sentinel cluster.
     def self.retry_connection_errors(attempts : Int32, &)
-      attempts.times do |i|
+      raise ArgumentError.new("attempts must be at least 1") if attempts < 1
+      (attempts - 1).times do
         begin
           return yield
-        rescue ex : IO::Error | DB::PoolResourceLost | DB::PoolRetryAttemptsExceeded | DB::PoolTimeout
-          raise ex if i == attempts - 1
+        rescue IO::Error | DB::PoolResourceLost | DB::PoolRetryAttemptsExceeded | DB::PoolTimeout
         end
       end
-      raise Error.new("unreachable: with_retry exhausted its loop without returning or raising")
+      yield
     end
 
     # Returns the URI of the currently active master.
@@ -234,13 +234,13 @@ module Redis
     def close : Nil
       @closed = true
       client, pubsub = @mutex.synchronize { {@client, @pubsub_conn} }
-      pubsub.try { |c| c.close rescue nil }
-      client.close rescue nil
+      pubsub.try &.close
+      client.close
     end
 
     # :nodoc:
     def finalize
-      close rescue nil
+      close
     end
 
     # Parse the flat key-value array returned by `SENTINEL sentinels <name>`.
@@ -251,10 +251,10 @@ module Redis
         ip = ""
         port = 26379
         flags = ""
-        entry.each_slice(2) do |kv|
+        entry.each_slice(2, reuse: true) do |kv|
           next unless kv.size == 2
           val = kv[1]
-          case kv[0].as?(String)
+          case kv[0].as(String)
           when "ip"    then ip = val.as(String)
           when "port"  then port = val.as(String).to_i
           when "flags" then flags = val.as(String)
@@ -291,25 +291,23 @@ module Redis
     private def discover_master_uri : URI
       last_error = nil
       registry_snapshot.each do |sentinel_uri|
-        conn = nil
         begin
-          conn = open_sentinel_connection(sentinel_uri)
-          result = conn.run({"sentinel", "get-master-addr-by-name", @master_name})
-          next unless result.is_a?(Array)
-          host, port = result
-          return self.class.build_master_uri(@master_uri_template, host.as(String), port.as(String).to_i)
+          open_sentinel_connection(sentinel_uri) do |conn|
+            result = conn.run({"sentinel", "get-master-addr-by-name", @master_name})
+            next unless result.is_a?(Array)
+            host, port = result
+            return self.class.build_master_uri(@master_uri_template, host.as(String), port.as(String).to_i)
+          end
         rescue ex
           Log.debug &.emit "Sentinel did not provide master address",
             sentinel: "#{sentinel_uri.host}:#{sentinel_uri.port}",
             error: ex.message.to_s
           last_error = ex
-        ensure
-          conn.try { |c| c.close rescue nil }
         end
       end
       raise Error.new(
-        "No sentinel could provide master address for #{@master_name.inspect}" +
-        (last_error ? " — last error: #{last_error.message}" : ""),
+        "No sentinel could provide master address for #{@master_name.inspect}",
+        cause: last_error,
       )
     end
 
@@ -329,7 +327,7 @@ module Redis
         )
         old
       end
-      spawn { old_client.close rescue nil }
+      spawn old_client.close
     end
 
     private def register_sentinel(uri : URI) : Nil
@@ -337,16 +335,23 @@ module Redis
       @registry_mutex.synchronize { @sentinel_registry[key] ||= uri }
     end
 
-    private def open_sentinel_connection(uri : URI) : Connection
-      Connection.new(uri, log: Log)
+    # Opens a connection to *uri*, yields it, and closes it once the block
+    # returns (normally, via an exception, or via a non-local `return`/`next`
+    # from the block) — every call site just needs a connection for the
+    # duration of the block, so the open/close bookkeeping lives here once.
+    private def open_sentinel_connection(uri : URI, &)
+      connection = Connection.new(uri, log: Log)
+      begin
+        yield connection
+      ensure
+        connection.close
+      end
     end
 
     # Queries *sentinel_uri* for its known peers, registering each one and
     # recording it in *reachable*. Returns `true` if the query succeeded.
     private def query_sentinel_for_peers(sentinel_uri : URI, reachable : ::Set(String)) : Bool
-      conn = nil
-      begin
-        conn = open_sentinel_connection(sentinel_uri)
+      open_sentinel_connection(sentinel_uri) do |conn|
         self.class.parse_sentinel_list(conn.run({"sentinel", "sentinels", @master_name})).each do |info|
           # Build a clean sentinel URI — only scheme/auth from the known sentinel,
           # no path so we don't accidentally send SELECT to a sentinel node.
@@ -359,15 +364,13 @@ module Redis
           ))
           reachable << "#{info.ip}:#{info.port}"
         end
-        true
-      rescue ex
-        Log.debug &.emit "Could not query sentinel for peers",
-          sentinel: "#{sentinel_uri.host}:#{sentinel_uri.port}",
-          error: ex.message.to_s
-        false
-      ensure
-        conn.try { |c| c.close rescue nil }
       end
+      true
+    rescue ex
+      Log.debug &.emit "Could not query sentinel for peers",
+        sentinel: "#{sentinel_uri.host}:#{sentinel_uri.port}",
+        error: ex.message.to_s
+      false
     end
 
     private def start_pubsub_watcher : Nil
@@ -402,13 +405,15 @@ module Redis
     # Opens a subscription to *sentinel_uri* and blocks until the connection
     # closes. Returns `true` if a connection was established (even if it later
     # dropped), `false` if the connection could not be made at all.
-    # The connection is always closed in `ensure`, preventing leaks.
+    # `open_sentinel_connection` closes the connection once the block returns,
+    # preventing leaks.
     private def subscribe_to_sentinel(sentinel_uri : URI) : Bool
-      conn = open_sentinel_connection(sentinel_uri)
-      @mutex.synchronize { @pubsub_conn = conn }
-      return false if closed?
-      conn.subscribe("+switch-master") do |sub, _|
-        sub.on_message { |_, msg| handle_switch_master(msg) unless closed? }
+      open_sentinel_connection(sentinel_uri) do |conn|
+        @mutex.synchronize { @pubsub_conn = conn }
+        return false if closed?
+        conn.subscribe("+switch-master") do |sub, _|
+          sub.on_message { |_, msg| handle_switch_master(msg) unless closed? }
+        end
       end
       true
     rescue ex
@@ -417,7 +422,6 @@ module Redis
         error: ex.message.to_s
       false
     ensure
-      conn.try { |c| c.close rescue nil }
       @mutex.synchronize { @pubsub_conn = nil }
     end
 
@@ -428,25 +432,18 @@ module Redis
       Log.warn &.emit "Error handling +switch-master", payload: message, error: ex.message.to_s
     end
 
-    # Runs *block* on a background fiber at *interval* until closed. Each run
-    # happens on its own fiber so a slow call (e.g. several unreachable
-    # sentinels) can't delay the timer itself; a run still in flight when the
-    # next tick fires is skipped rather than stacked.
+    # Runs *block* on a background fiber every *interval* until closed. If a
+    # run takes longer than *interval*, the next tick is simply delayed until
+    # it finishes rather than overlapping with it.
     private def start_watcher_fiber(interval : Time::Span, label : String, &block : -> Nil) : Nil
-      running = false
       spawn do
         until closed?
           sleep interval
-          next if closed? || running
-          running = true
-          spawn do
-            begin
-              block.call
-            rescue ex
-              Log.warn &.emit "#{label} failed", error: ex.message.to_s
-            ensure
-              running = false
-            end
+          break if closed?
+          begin
+            block.call
+          rescue ex
+            Log.warn &.emit "#{label} failed", error: ex.message.to_s
           end
         end
       end
