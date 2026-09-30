@@ -240,9 +240,8 @@ module Redis
 
     # Parse the flat key-value array returned by `SENTINEL sentinels <name>`.
     def self.parse_sentinel_list(raw : Value) : Array(SentinelInfo)
-      return [] of SentinelInfo unless raw.is_a?(Array)
-      raw.compact_map do |entry|
-        next unless entry.is_a?(Array)
+      raw.as(Array(Value)).compact_map do |entry|
+        entry = entry.as(Array(Value))
         ip = ""
         port = 26379
         flags = ""

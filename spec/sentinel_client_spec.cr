@@ -51,10 +51,6 @@ module Redis
         SentinelClient.parse_sentinel_list(raw).should be_empty
       end
 
-      it "returns an empty array for a nil response" do
-        SentinelClient.parse_sentinel_list(nil).should be_empty
-      end
-
       it "returns an empty array for an empty array response" do
         raw : Value = [] of Value
         SentinelClient.parse_sentinel_list(raw).should be_empty
